@@ -1,8 +1,0 @@
-{
-    "networkCard": "enp1s0",
-    "domain": "test.top",
-    "key": "2**",
-    "subDomian": [
-        "api.test.top"
-    ]
-}

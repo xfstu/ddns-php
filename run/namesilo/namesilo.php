@@ -8,7 +8,7 @@ date_default_timezone_set('Asia/Shanghai');
 function get($url, $test = false)
 {
   if ($test) {
-    // echo $url;
+    echo "debug模式：url=" . $url . "\n";
     return;
   }
   $client = new Client();
@@ -18,29 +18,58 @@ function get($url, $test = false)
 
 class DDns
 {
-  public $address;
-
   private $domain;
   private $key;
-  private $subDomian;
+  private $subDomian = [];
   private $networkCard;
-  private $index=4;
-  private $timestamp=0;
+  private $confPaht = '/home/config';
 
   function __construct()
   {
-    if (!file_exists('/home/config.json')) {
-      echo "未找到config.json，请放至/home目录下 \n";
-      sleep(10);
-      $ddns = new DDns();
-      $ddns->start();
+    $this->setConfig();
+  }
+
+  private function setConfig()
+  {
+    if (!file_exists($this->confPaht . '/config.json')) {
+      $mkdir = mkdir($this->confPaht, 0777, true);
+      if ($mkdir == false) {
+        echo '创建文件夹失败';
+        sleep(10);
+        return $this->setConfig();
+      }
+      $init = [
+        "networkCard" => "enp1s0",
+        "domain" => null,
+        "key" => null,
+        "subDomian" => [
+          [
+            "type" => "AAAA",
+            "host" => "cname",
+            "ttl" => 3600
+          ]
+        ]
+      ];
+      file_put_contents($this->confPaht . '/config.json', json_encode($init));
+      return $this->setConfig();
     }
-    $config = json_decode(file_get_contents('/home/config.json'), true);
+    $config = json_decode(file_get_contents($this->confPaht . '/config.json'), true);
+    if (!$config['domain'] || !$config['key']) {
+      echo "请先配置域名或key\n";
+      sleep(10);
+      return $this->setConfig();
+    }
     $this->domain = $config['domain'];
     $this->key = $config['key'];
     $this->subDomian = $config['subDomian'];
     $this->networkCard = $config['networkCard'];
+    echo "配置成功：\n域名：{$this->domain};\nkey：{$this->key}；\n网络卡：{$this->networkCard}；\n";
+    foreach ($this->subDomian as $row) {
+      echo "主机：{$row['host']}，类型：{$row['type']}，TTL：{$row['ttl']}。\n";
+    }
   }
+
+
   public function getAddress()
   {
     $networkCard = $this->networkCard;
@@ -52,9 +81,18 @@ class DDns
         $isIp = $ip;
       }
     }
-    $this->address = $isIp;
-    echo "当前主机IP：$isIp \n";
+    #echo "当前主机IP：$isIp \n";
     return $isIp;
+  }
+
+  private function checkHost($host, $type)
+  {
+    $subDomian = $this->subDomian;
+    foreach ($subDomian as $row) {
+      if ($row['host'] . '.' . $this->domain == $host && $row['type'] == $type) {
+        return $row;
+      }
+    }
   }
 
   public function getDns()
@@ -62,25 +100,26 @@ class DDns
     $response = get("https://www.namesilo.com/api/dnsListRecords?version=1&type=xml&key={$this->key}&domain={$this->domain}");
     $body = $response;
     $xml = simplexml_load_string($body);
-    $ipList = $xml->reply->resource_record;
-    $array = [];
-    $updateDomain = $this->subDomian;
-    foreach ($ipList as $row) {
-      if (in_array($row->host, $updateDomain) && $row->type == 'AAAA') {
-        $host = explode('.', $row->host);
-        $row->host = $host[0];
-        $array[] = json_decode(json_encode($row), true);
-      }
+    $records = $xml->reply->resource_record;
+    $cache = [];
+    foreach ($records as $row) {
+      $cache[] = $row;
     }
-    file_put_contents(__DIR__ . '/cache.json', json_encode($array));
-    return $array;
+    if (count($cache) == 0) {
+      echo "从服务商获取失败，正在重新获取\n";
+      sleep(3);
+      return $this->getDns();
+    }
+    file_put_contents($this->confPaht  . '/cache.json', json_encode($cache));
+    echo "从服务商获取配置成功，路径：{$this->confPaht}/cache.json\n";
+    return json_decode(json_encode($cache), true);
   }
   public function check()
   {
     //先检查缓存
     $cache = null;
-    if (file_exists(__DIR__ . '/cache.json')) {
-      $cache = json_decode(file_get_contents(__DIR__ . '/cache.json'), true);
+    if (file_exists($this->confPaht .  '/cache.json')) {
+      $cache = json_decode(file_get_contents($this->confPaht .  '/cache.json'), true);
     }
     if ($cache) {
       $array = $cache;
@@ -90,57 +129,40 @@ class DDns
     $ip = $this->getAddress();
     $updateArray = [];
     foreach ($array as $row) {
-      if ($row['value'] != $ip) {
-        $updateArray[] = $row;
+      $updateHost = $this->checkHost($row['host'], $row['type']);
+      if ($updateHost && $row['value'] != $ip) {
+        $updateRow = $row;
+        $updateRow['host'] = $updateHost['host'];
+        $updateArray[] = $updateRow;
       }
     }
     return $updateArray;
   }
+
   public function start()
   {
-    $this->index++;
     $updateArray = $this->check();
 
     if (function_exists('fastcgi_finish_request')) {
       // fastcgi_finish_request(); //FPM模式下使用，非阻塞运行
     }
     if ($updateArray) {
-      echo "当前时间：" . date('Y-m-d H:i:s') . "。新IP：" . $this->address . "\n";
+      echo "当前时间：" . date('Y-m-d H:i:s') . "\n";
       foreach ($updateArray as $row) {
         $rrid = $row['record_id'];
         $host = $row['host'];
         $addr = $this->getAddress();
         get("https://www.namesilo.com/api/dnsUpdateRecord?version=1&type=xml&key={$this->key}&domain={$this->domain}&rrid=" . $rrid . '&rrhost=' . $host . '&rrvalue=' . $addr . '&rrttl=3600', false);
-        echo "$host 更新成功\n";
+        echo "【{$host}】 已更新IP：$addr\n";
       }
       //更新完了就删除缓存
-      unlink(__DIR__ . '/cache.json');
+      unlink($this->confPaht . '/cache.json');
+      echo "全部subdomain更新完毕，30分钟后重新检查。\n";
+    } else {
+      echo "当前时间：" . date('Y-m-d H:i:s') . "。没有更新IP，30分钟后重新检查。\n";
     }
-    if ($this->index == 0) {
-      echo date('Y-m-d H:i:s')." 更新完毕，休息24小时\n";
-      sleep(86400);
-      return $this->start();
-    }
-    if ($this->index == 1) {
-      echo date('Y-m-d H:i:s')." 1天了还没有更新，休息12小时\n";
-      sleep(43200);
-      return $this->start();
-    }
-    if ($this->index >= 2 && $this->index <4) {
-      echo date('Y-m-d H:i:s')." 1.5天还没有更新，间隔6小时，查询2次\n";
-      sleep(21600);
-      return $this->start();
-    }
-    if ($this->index >= 4 && $this->index <28) {
-      echo date('Y-m-d H:i:s')." 2天还没有更新，间隔1小时，查询24次\n";
-      sleep(3600);
-      return $this->start();
-    }
-    if ($this->index >= 28) {
-      echo date('Y-m-d H:i:s')." 3天还没有更新，1分钟查询1次\n";
-      sleep(60);
-      return $this->start();
-    }
+    sleep(1800);
+    return $this->start();
   }
 }
 
